@@ -1,0 +1,75 @@
+name: Unpack UEFI images
+
+on:
+  push:
+    paths:            # root-level files only ('*' does not cross folders)
+      - '*.bin'
+      - '*.img'
+      - '*.fd'
+      - '*.elf'
+      - '*.mbn'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: unpack-uefi
+  cancel-in-progress: false
+
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Find images in repo root
+        id: find
+        run: |
+          shopt -s nullglob nocaseglob
+          files=(*.bin *.img *.fd *.elf *.mbn)
+          echo "Found ${#files[@]} file(s): ${files[*]}"
+          echo "count=${#files[@]}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup .NET 8
+        if: steps.find.outputs.count != '0'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Clone and build UEFIReader
+        if: steps.find.outputs.count != '0'
+        run: |
+          git clone --depth 1 https://github.com/MSMTools/UEFIReader.git "$RUNNER_TEMP/src"
+          proj=$(find "$RUNNER_TEMP/src" -name UEFIReader.csproj | head -n1)
+          dotnet publish "$proj" -c Release -o "$RUNNER_TEMP/uefireader"
+
+      - name: Unpack, remove binaries, commit
+        if: steps.find.outputs.count != '0'
+        run: |
+          shopt -s nullglob nocaseglob
+          fail=0
+          for f in *.bin *.img *.fd *.elf *.mbn; do
+            out="Unpacked/$f"      # full filename, so xbl.img and xbl.elf never collide
+            rm -rf "$out"; mkdir -p "$out"
+            echo "=== $f -> $out"
+            if dotnet "$RUNNER_TEMP/uefireader/UEFIReader.dll" "$f" "$out"; then
+              git rm -q -f "$f"          # only removed after a successful unpack
+            else
+              echo "::error::Failed to unpack $f (binary kept)"
+              rm -rf "$out"
+              fail=1
+            fi
+          done
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A Unpacked
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+          else
+            git commit -m "Unpack UEFI images and remove binaries"
+            git push
+          fi
+          exit $fail
